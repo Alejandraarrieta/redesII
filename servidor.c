@@ -6,6 +6,10 @@
 #include <unistd.h>
 #include <err.h>
 #include <netinet/in.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <ctype.h>
+#include <arpa/inet.h>
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -21,6 +25,9 @@
 #define MSG_550 "550 %s: no such file or directory\r\n"
 #define MSG_299 "299 File %s size %ld bytes\r\n"
 #define MSG_226 "226 Transfer complete\r\n"
+#define MSG_150 "150 Opening BINARY mode data connection for %s (%ld bytes)\r\n"
+#define MSG_200 "200 PORT command successful\r\n"
+
 
 /**
  * Función: recv_cmd
@@ -259,6 +266,185 @@ void operate(int sd) {
     }
 }
 
+/**
+ * Funcion: port
+ * -------------------
+ *En resumen, esta función se encarga de extraer la dirección IP y el puerto de los datos
+ *del socket enviados por el cliente durante el comando PORT, y construye una estructura 
+ *sockaddr_in que representa esa dirección y puerto. Esta estructura se utilizará más adelante
+ * para establecer la conexión de datos entre el cliente y el servidor FTP.
+ * La estructura sockaddr_in se encuentra definida en la biblioteca de sockets de C
+ * struct sockaddr_in {
+    sa_family_t sin_family; // Familia de direcciones, generalmente AF_INET
+    in_port_t sin_port;     // Puerto en el orden de bytes de red
+    struct in_addr sin_addr; // Dirección IP en el orden de bytes de red
+    unsigned char sin_zero[8]; // Relleno para que la estructura tenga el tamaño adecuado
+};
+
+ */
+
+struct sockaddr_in port(int sd, char *socketdata){
+    struct sockaddr_in addr;
+    int puerto, i, j, count;
+    char *ip, *aux1, *aux2;
+    ip = (char*)malloc(30*sizeof(char));
+    aux1 = (char*)malloc(4*sizeof(char));
+    aux2 = (char*)malloc(4*sizeof(char));
+
+    i = j = 0;
+    count=0;
+
+    while(true){
+        if (*(socketdata+i) == ',') count++;
+
+        if (count<=3){
+            *(ip+j) = *(socketdata+i);
+            if (*(ip+j) == ',') *(ip+j) = '.';
+            j++;
+        }
+        if (*(socketdata+i) == ',' && count==4){
+            *(ip+j) = '\0';
+            j=0;
+            i++;
+            continue;
+        }
+
+        if(count==4){
+            *(aux1+j) = *(socketdata+i);
+            j++;
+        }
+
+        if (*(socketdata+i) == ',' && count==5){
+            *(aux1+j) = '\0';
+            j=0;
+            i++;
+            continue;
+        }
+
+        if(count==5){
+            *(aux2+j) = *(socketdata+i);
+            j++;
+        }
+
+        if (*(socketdata+i) == '\0'){
+            *(aux2+j) = '\0';
+            break;
+        }
+        i++;
+    }
+    puerto = 256 * atoi(aux1) + atoi(aux2);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr(ip);
+    addr.sin_port = htons(puerto);
+
+    free(ip);
+    free(aux1);
+    free(aux2);
+
+    send_ans(sd, MSG_200);
+
+    return addr;
+}
+
+/**
+ * Función: stor
+ * ---------------------------------
+ * Recibe un archivo enviado por el cliente a través de una conexión de datos.
+ *
+ * sd El descriptor de socket de la conexión de control.
+ * addr La estructura sockaddr_in que contiene la información de la conexión de datos.
+ * file_data Los datos del archivo que se van a recibir.
+ */
+void stor(int sd, struct sockaddr_in addr, char *file_data) {
+    FILE *file;
+    long f_size, recv_s, r_size = BUFSIZE;
+    char buffer[BUFSIZE];
+    int srcsd;
+    char *file_path, *file_size, *aux;
+
+    // Reserva memoria para las variables auxiliares
+    file_path = (char*)malloc(50*sizeof(char));
+    file_size = (char*)malloc(25*sizeof(char));
+
+    // Extrae el nombre del archivo y su tamaño de los datos del archivo
+    aux = strtok(file_data, "//");
+    strcpy(file_path, aux);
+    aux = strtok(NULL, "//");
+    strcpy(file_size, aux);
+    f_size = atoi(file_size);
+
+    // Envía una respuesta al cliente indicando que el servidor está listo para recibir el archivo
+    send_ans(sd, MSG_150, file_path);
+
+    // Abre una conexión al cliente a través del socket de datos
+    srcsd = socket(AF_INET, SOCK_STREAM, 0);
+    if (srcsd < 0) errx(2, "Cannot create socket");
+
+    if (connect(srcsd, (struct sockaddr *) &addr, sizeof(addr)) < 0) errx(3, "Error on connect to data channel");
+
+    // Abre el archivo en modo escritura para escribir en él
+    file = fopen(file_path, "w");
+
+    // Recibe el archivo en bloques y escribe los datos en el archivo local
+    while (true) {
+        if (f_size < BUFSIZE) r_size = f_size;
+
+        // Lee los datos del socket de datos
+        recv_s = read(srcsd, buffer, r_size);
+        if (recv_s < 0) warn("receive error");
+
+        // Escribe los datos recibidos en el archivo
+        fwrite(buffer, 1, r_size, file);
+
+        if (f_size < BUFSIZE) break;
+        f_size = f_size - BUFSIZE;
+    }
+
+    // Cierra la conexión al cliente
+    close(srcsd);
+
+    // Envía un mensaje indicando que la transferencia del archivo se ha completado
+    send_ans(sd, MSG_226);
+
+    // Libera la memoria reservada
+    free(file_path);
+    free(file_size);
+
+    return;
+}
+
+/**
+ * Función: direccion_puerto
+ * ----------------
+ * Verifica si una cadena de caracteres representa un número de puerto válido.
+ *
+ * @param string La cadena de caracteres a verificar.
+ * @return true si la cadena representa un número de puerto válido, false de lo contrario.
+ */
+bool direccion_puerto(char *string){
+    bool verificacion = true;
+    int i=0;
+    while(*(string+i)!='\0'){
+        if(!isdigit(*(string+i))) verificacion = false;
+        i++;
+    }
+    if(atoi(string)<0 || atoi(string)>65535) verificacion = false;
+    return verificacion;
+}
+
+/**
+ * Función: sig_handler
+ * 
+ * Manejador de señales para la señal SIGCHLD.
+ *
+ * @param sig El número de la señal recibida.
+ */
+void sig_handler(int sig){
+    if(sig == SIGCHLD){
+        waitpid(-1, NULL, WNOHANG);
+    }
+}
+
 int main(int argc, char *argv[]) {
     // Verificación de argumentos
     if (argc < 2) {
@@ -298,10 +484,20 @@ int main(int argc, char *argv[]) {
 
     // Bucle principal
     while (true) {
+        pid_t pid;
         // Aceptar conexiones secuencialmente y comprobar errores
         socklen_t slave_addr_len = sizeof(slave_addr);
         if ((slave_sd = accept(master_sd, (struct sockaddr *)&slave_addr, &slave_addr_len)) < 0) {
             err(1, "Error accepting connection");
+        }
+
+
+        signal(SIGCHLD, sig_handler);
+
+        pid = fork();
+        if(pid == 0){
+            close(master_sd);
+            break;
         }
 
         // Enviar saludo al cliente
